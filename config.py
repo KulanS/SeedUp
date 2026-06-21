@@ -37,6 +37,17 @@ TOKEN_FILE = 'token.pickle'
 CREDENTIALS_FILE = 'credentials.dat'
 GOOGLE_DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
+# Torrent Inspector Configuration
+METADATA_TIMEOUT = 120  # seconds to wait for magnet metadata
+PREVIEW_CACHE_FILE = ".torrent_preview_cache.json"
+
+# Pipeline Configuration
+PIPELINE_QUEUE_SIZE = 5                         # max files queued between download/upload threads
+DRIVE_SPACE_BUFFER = 500 * 1024 * 1024          # 500 MB buffer to keep free on Drive
+UPLOAD_MAX_RETRIES = 3                          # retry count per file upload
+UPLOAD_RETRY_DELAY = 5                          # base delay in seconds (exponential backoff)
+DISK_SAFETY_THRESHOLD = 1 * 1024 * 1024 * 1024  # 1 GB — pause download if local disk below this
+
 # Logging Configuration
 logging.basicConfig(
     level=logging.INFO,

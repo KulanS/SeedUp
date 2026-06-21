@@ -115,6 +115,12 @@ Just run your commands directly - no manual setup required!
         action='store_true',
         help='Force re-upload even if files exist in Drive'
     )
+    download_parser.add_argument(
+        '--select',
+        type=str,
+        default='all',
+        help='File indices to download: "all" or comma-separated indices from preview (e.g. "0,2,5")'
+    )
     
     # Upload command
     upload_parser = subparsers.add_parser('upload', help='Upload files to Google Drive (Colab only)')
@@ -141,21 +147,66 @@ Just run your commands directly - no manual setup required!
     # Clear command
     subparsers.add_parser('clear', help='Clear download session')
     
+    # Preview command
+    preview_parser = subparsers.add_parser('preview', help='Preview torrent contents before downloading')
+    preview_parser.add_argument(
+        '-t', '--torrent',
+        type=str,
+        required=True,
+        help='Torrent file path or magnet link'
+    )
+    preview_parser.add_argument(
+        '--check-drive',
+        action='store_true',
+        help='Check Google Drive upload status for each file'
+    )
+    
     return parser.parse_args()
 
 
 def handle_download(args):
     """Handle torrent download command."""
+    
+    # Resolve file selection
+    selected_indices = None
+    if args.select and args.select.strip().lower() != 'all':
+        # Need to inspect torrent first to map group indices to file indices
+        from torrent_inspector import inspect_torrent, resolve_selected_indices
+        info = inspect_torrent(args.torrent)
+        if info is None:
+            logger.error("Failed to fetch torrent metadata for selection")
+            return 1
+        selected_indices = resolve_selected_indices(info, args.select)
+        if selected_indices is not None and len(selected_indices) == 0:
+            logger.error("No valid files selected. Use 'all' or valid indices.")
+            return 1
+    
+    # Use pipeline when --upload is set (incremental download + upload)
+    if args.upload:
+        from pipeline import run_pipeline
+        
+        result = run_pipeline(
+            source=args.torrent,
+            download_path=args.destination,
+            auto_resume=not args.no_resume,
+            selected_indices=selected_indices,
+            folder_id=args.folder_id,
+            skip_existing=not args.no_skip,
+        )
+        
+        return 0 if result.success else 1
+    
+    # Legacy: download-only mode (no upload)
     print("="*60)
     print("TORRENT DOWNLOADER")
     print("="*60)
     
-    # Download the torrent
     logger.info(f"Starting download: {args.torrent}")
     downloaded_path = download_torrent(
         args.torrent,
         download_path=args.destination,
-        auto_resume=not args.no_resume
+        auto_resume=not args.no_resume,
+        selected_indices=selected_indices,
     )
     
     if not downloaded_path:
@@ -163,47 +214,6 @@ def handle_download(args):
         return 1
     
     logger.info(f"Download completed: {downloaded_path}")
-    
-    # Upload to Google Drive if requested
-    if args.upload:
-        print("\n" + "="*60)
-        print("UPLOADING TO GOOGLE DRIVE")
-        print("="*60)
-        
-        try:
-            # Load uploader
-            upload_to_google_drive = get_uploader()
-            
-            results = upload_to_google_drive(
-                downloaded_path,
-                args.folder_id,  # Can be None, will use SeedUp folder
-                skip_existing=not args.no_skip
-            )
-            
-            if results['failed']:
-                logger.warning(f"Some files failed to upload ({len(results['failed'])} items)")
-                return 1
-            
-            logger.info("Upload completed successfully!")
-            
-        except RuntimeError as e:
-            # Catch environment/initialization errors with formatted message
-            error_str = str(e)
-            if error_str.startswith('\n'):
-                # Already formatted, just print it
-                print(error_str)
-            else:
-                # Wrap in formatting
-                print("\n" + "="*60)
-                print("UPLOAD ERROR")
-                print("="*60)
-                print(error_str)
-                print("="*60)
-            return 1
-        except Exception as e:
-            logger.error(f"Upload failed: {str(e)}")
-            return 1
-    
     return 0
 
 
@@ -276,6 +286,38 @@ def handle_clear(args):
         return 1
 
 
+def handle_preview(args):
+    """Handle torrent preview command."""
+    from torrent_inspector import inspect_torrent, display_torrent_info
+    
+    info = inspect_torrent(args.torrent)
+    if info is None:
+        logger.error("Failed to fetch torrent metadata")
+        return 1
+    
+    drive_status = None
+    drive_space = None
+    
+    if args.check_drive:
+        try:
+            from gdrive_uploader import check_drive_status, get_drive_space_info
+            drive_status = check_drive_status(
+                info.all_files,
+                download_path=TORRENT_DOWNLOAD_PATH
+            )
+            drive_space = get_drive_space_info()
+        except Exception as e:
+            logger.warning(f"Could not check Drive status: {e}")
+    
+    display_torrent_info(info, drive_status=drive_status, drive_space=drive_space)
+    
+    print("💡 To download, run:")
+    print(f"   python main.py download -t \"{args.torrent}\" --upload --select all")
+    print(f"   python main.py download -t \"{args.torrent}\" --upload --select 0,2,5")
+    
+    return 0
+
+
 def main():
     """Main entry point."""
     args = parse_arguments()
@@ -296,6 +338,8 @@ def main():
             return handle_status(args)
         elif args.command == 'clear':
             return handle_clear(args)
+        elif args.command == 'preview':
+            return handle_preview(args)
         else:
             logger.error(f"Unknown command: {args.command}")
             return 1

@@ -66,7 +66,8 @@ def load_session(session_file=TORRENT_SESSION_FILE):
 
 
 def download_torrent(source, download_path=TORRENT_DOWNLOAD_PATH, 
-                    session_file=TORRENT_SESSION_FILE, auto_resume=True):
+                    session_file=TORRENT_SESSION_FILE, auto_resume=True,
+                    selected_indices=None):
     """
     Download a torrent file using libtorrent, with support for stopping/resuming.
     
@@ -74,6 +75,9 @@ def download_torrent(source, download_path=TORRENT_DOWNLOAD_PATH,
     :param download_path: Directory to save the downloaded content.
     :param session_file: File to save/load session state.
     :param auto_resume: Automatically load previous session if available.
+    :param selected_indices: Optional list of libtorrent file indices to download.
+                            If None, download all files. If provided, only files
+                            with these indices will be downloaded (others set to priority 0).
     :return: Path to downloaded content or None on failure.
     """
     if not os.path.exists(download_path):
@@ -134,6 +138,20 @@ def download_torrent(source, download_path=TORRENT_DOWNLOAD_PATH,
 
     torrent_name = handle.status().name
     logger.info(f"Downloading: {torrent_name}")
+
+    # Apply selective file priorities if specified
+    if selected_indices is not None:
+        torrent_info_obj = handle.get_torrent_info()
+        num_files = torrent_info_obj.files().num_files()
+        priorities = [0] * num_files
+        for idx in selected_indices:
+            if 0 <= idx < num_files:
+                priorities[idx] = 1
+            else:
+                logger.warning(f"File index {idx} out of range (0-{num_files-1}), ignoring.")
+        handle.prioritize_files(priorities)
+        selected_count = sum(1 for p in priorities if p > 0)
+        logger.info(f"Selective download: {selected_count}/{num_files} files selected")
 
     try:
         while handle.status().state != lt.torrent_status.seeding:

@@ -38,7 +38,7 @@ warnings.filterwarnings("ignore", message="file_cache is only supported with oau
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
-from config import get_logger
+from config import get_logger, DRIVE_SPACE_BUFFER
 
 logger = get_logger(__name__)
 # Suppress INFO level logging to reduce verbose output
@@ -129,6 +129,212 @@ def get_or_create_seedup_folder(drive_service) -> Optional[str]:
 def set_drive_service(service):
     """Legacy function - no longer needed with automatic authentication."""
     logger.info("Drive service set (using automatic authentication)")
+
+
+# ─── Drive Space & Status Functions ──────────────────────────────────────────
+
+def get_drive_space_info(drive_service=None):
+    """
+    Get Google Drive storage quota information.
+    
+    Args:
+        drive_service: Optional authenticated Drive service. If None, creates one.
+        
+    Returns:
+        Dictionary with storage info:
+            total (int): total quota in bytes
+            used (int): used space in bytes  
+            free (int): free space in bytes
+            total_hr (str): human-readable total
+            used_hr (str): human-readable used
+            free_hr (str): human-readable free
+        Returns None if not in Colab or query fails.
+    """
+    from torrent_inspector import format_size
+    
+    if not IN_COLAB:
+        return None
+    
+    try:
+        if drive_service is None:
+            drive_service = get_drive_service()
+        
+        about = drive_service.about().get(fields='storageQuota').execute()
+        quota = about.get('storageQuota', {})
+        
+        # Google Drive returns strings for these values
+        total = int(quota.get('limit', 0))
+        used = int(quota.get('usage', 0))
+        free = total - used if total > 0 else 0
+        
+        return {
+            'total': total,
+            'used': used,
+            'free': free,
+            'total_hr': format_size(total),
+            'used_hr': format_size(used),
+            'free_hr': format_size(free),
+        }
+    except Exception as e:
+        logger.error(f"Failed to get Drive space info: {e}")
+        return None
+
+
+def validate_drive_capacity(torrent_size, drive_service=None, buffer=DRIVE_SPACE_BUFFER):
+    """
+    Check if Google Drive has enough free space for the torrent.
+    
+    Args:
+        torrent_size: Total size of torrent content in bytes
+        drive_service: Optional authenticated Drive service
+        buffer: Extra buffer space to keep free (default from config)
+        
+    Returns:
+        Tuple of (is_sufficient: bool, space_info: dict or None)
+        If insufficient, prints error message. Caller should exit.
+    """
+    from torrent_inspector import format_size
+    
+    space_info = get_drive_space_info(drive_service)
+    if space_info is None:
+        logger.warning("Could not check Drive space — proceeding without validation")
+        return True, None
+    
+    required = torrent_size + buffer
+    available = space_info['free']
+    
+    if available >= required:
+        return True, space_info
+    
+    # Insufficient space — print detailed error
+    print(f"\n{'━' * 50}")
+    print(f"📊  Storage Check")
+    print(f"{'━' * 50}")
+    print(f"  Torrent size:       {format_size(torrent_size)}")
+    print(f"  Google Drive free:  {space_info['free_hr']} / {space_info['total_hr']}")
+    print(f"  Buffer required:    {format_size(buffer)}")
+    print(f"  {'─' * 46}")
+    print(f"  ❌ NOT ENOUGH SPACE on Google Drive")
+    print(f"  Need: {format_size(torrent_size)} + {format_size(buffer)} = {format_size(required)}")
+    print(f"  Have: {space_info['free_hr']}")
+    shortfall = required - available
+    print(f"\n  Please free up {format_size(shortfall)} on Google Drive and try again.")
+    print(f"{'━' * 50}\n")
+    
+    return False, space_info
+
+
+def check_drive_status(file_list, drive_service=None, folder_id=None, download_path=None):
+    """
+    Check Google Drive upload status for a list of torrent files.
+    
+    Compares files in the torrent against what exists in the GDrive
+    'SeedUp Downloads' folder (or custom folder_id).
+    
+    Args:
+        file_list: List of TorrentFileInfo objects (with path, size, name)
+        drive_service: Optional authenticated Drive service
+        folder_id: Optional custom GDrive folder ID
+        download_path: Optional local download path to check for partial files
+        
+    Returns:
+        Dictionary mapping file paths to status strings:
+            "✅ Done" — file exists in Drive with matching size
+            "⬇ XX%" — file partially downloaded locally, not on Drive
+            "⏳ Pending" — not downloaded, not on Drive
+            "⚠️ Size mismatch" — file on Drive but size differs
+        Returns empty dict if not in Colab or check fails.
+    """
+    if not IN_COLAB:
+        return {}
+    
+    try:
+        if drive_service is None:
+            drive_service = get_drive_service()
+        
+        # Resolve the target folder
+        if folder_id is None:
+            folder_id = get_or_create_seedup_folder(drive_service)
+            if not folder_id:
+                return {}
+        
+        # Build a lookup of existing files in Drive (recursively)
+        drive_files = _list_drive_files_recursive(drive_service, folder_id)
+        
+        status = {}
+        for f in file_list:
+            # Check Drive first
+            drive_match = drive_files.get(f.name)
+            if drive_match:
+                drive_size = int(drive_match.get('size', 0))
+                if drive_size == f.size:
+                    status[f.path] = "✅ Done"
+                else:
+                    status[f.path] = "⚠️ Size mismatch"
+                continue
+            
+            # Check local partial download
+            if download_path:
+                local_path = os.path.join(download_path, f.path)
+                if os.path.exists(local_path):
+                    local_size = os.path.getsize(local_path)
+                    if f.size > 0:
+                        pct = int(local_size / f.size * 100)
+                        status[f.path] = f"⬇ {pct}%"
+                    else:
+                        status[f.path] = "⬇ 0%"
+                    continue
+            
+            status[f.path] = "⏳ Pending"
+        
+        return status
+        
+    except Exception as e:
+        logger.error(f"Failed to check Drive status: {e}")
+        return {}
+
+
+def _list_drive_files_recursive(drive_service, folder_id, _result=None):
+    """
+    Recursively list all files in a Google Drive folder.
+    
+    Args:
+        drive_service: Authenticated Drive service
+        folder_id: Folder ID to list
+        
+    Returns:
+        Dictionary mapping filename to file info dict (id, name, size, mimeType)
+    """
+    if _result is None:
+        _result = {}
+    
+    try:
+        page_token = None
+        while True:
+            query = f"'{folder_id}' in parents and trashed=false"
+            results = drive_service.files().list(
+                q=query,
+                fields='nextPageToken, files(id, name, size, mimeType)',
+                pageSize=100,
+                pageToken=page_token
+            ).execute()
+            
+            for item in results.get('files', []):
+                if item.get('mimeType') == 'application/vnd.google-apps.folder':
+                    # Recurse into subfolders
+                    _list_drive_files_recursive(drive_service, item['id'], _result)
+                else:
+                    _result[item['name']] = item
+            
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
+                
+    except HttpError as e:
+        logger.error(f"Error listing Drive files: {e}")
+    
+    return _result
+
 
 class SimpleDriveUploader:
     """Simplified Google Drive uploader with progress bars and skip existing feature."""
