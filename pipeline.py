@@ -92,6 +92,23 @@ class PipelineProgress:
         self.upload_queue_size = 0
         self.upload_done = False
 
+        # Header lines to preserve when clearing output
+        self._header_lines = []
+
+        # Detect IPython/Colab environment
+        self._use_clear_output = False
+        self._clear_output_fn = None
+        try:
+            from IPython.display import clear_output
+            self._clear_output_fn = clear_output
+            self._use_clear_output = True
+        except ImportError:
+            pass
+
+    def set_header(self, lines):
+        """Store header lines to reprint after each clear_output."""
+        self._header_lines = lines
+
     def update_download(self, progress, speed, eta, seeds, peers):
         with self._lock:
             self.download_progress = progress
@@ -107,7 +124,7 @@ class PipelineProgress:
             self.upload_queue_size = queue_size
 
     def display(self):
-        """Print the dual-progress display."""
+        """Print the dual-progress display (Colab-compatible)."""
         with self._lock:
             # Download line
             dl_pct = self.download_progress * 100
@@ -140,11 +157,18 @@ class PipelineProgress:
                        f"Files: {self.uploaded_files}/{self.total_files} | "
                        f"Queued: {self.upload_queue_size}")
 
-        # Move cursor up 2 lines and overwrite
-        print(f"\r\033[2K{dl_line}", flush=True)
-        print(f"\r\033[2K{ul_line}", end="", flush=True)
-        # Move cursor up so next call overwrites
-        print(f"\033[1A\r", end="", flush=True)
+        if self._use_clear_output:
+            # Colab/IPython: clear cell output and reprint everything
+            self._clear_output_fn(wait=True)
+            for line in self._header_lines:
+                print(line)
+            print(dl_line)
+            print(ul_line)
+        else:
+            # Terminal fallback: compact single-line with \r
+            compact = (f"\rDL: {dl_pct:5.1f}% {speed_str} ETA:{self.download_eta} | "
+                       f"UL: {ul_pct:5.1f}% {self.uploaded_files}/{self.total_files} files")
+            print(compact, end="", flush=True)
 
 
 # ─── Downloader Thread ────────────────────────────────────────────────────────
@@ -581,14 +605,26 @@ def run_pipeline(source, download_path=TORRENT_DOWNLOAD_PATH,
         total_files=effective_files,
     )
 
+    # Store header lines so they're reprinted after each clear_output in Colab
+    header_lines = [
+        "━" * 60,
+        "📦 SEEDUP PIPELINE — Incremental Download & Upload",
+        "━" * 60,
+        f"   Torrent: {torrent_info.name}",
+        f"   Size: {format_size(effective_size)} ({effective_files} files)",
+    ]
+    if space_info:
+        header_lines.append(f"   ✅ Drive: {space_info['free_hr']} free / {space_info['total_hr']} total")
+    header_lines.append("")
+    header_lines.append("🚀 Pipeline running...")
+    header_lines.append("")
+    progress.set_header(header_lines)
+
     dl_results = {}
     ul_results = {}
 
     # Start threads
     print(f"\n🚀 Starting pipeline...\n")
-    # Print two empty lines for the progress display to overwrite
-    print()
-    print()
 
     dl_thread = threading.Thread(
         target=_downloader_thread,
@@ -624,7 +660,7 @@ def run_pipeline(source, download_path=TORRENT_DOWNLOAD_PATH,
 
     # Final progress display
     progress.display()
-    print("\n\n")  # Move past the progress lines
+    print()  # Clean newline after progress
 
     elapsed = time.time() - start_time
 
