@@ -71,7 +71,7 @@ class PipelineResult:
 # ─── Shared Progress State ───────────────────────────────────────────────────
 
 class PipelineProgress:
-    """Thread-safe shared progress state for the pipeline."""
+    """Thread-safe shared progress state for the pipeline display."""
 
     def __init__(self, total_size, total_files):
         self._lock = threading.Lock()
@@ -83,17 +83,26 @@ class PipelineProgress:
         self.download_speed = 0            # bytes/sec
         self.download_eta = "N/A"
         self.download_done = False
+        self.downloaded_size = 0           # bytes downloaded so far
         self.seeds = 0
         self.peers = 0
 
         # Upload state
-        self.uploaded_size = 0             # bytes
+        self.uploaded_size = 0             # bytes successfully uploaded to GDrive
         self.uploaded_files = 0
         self.upload_queue_size = 0
         self.upload_done = False
 
+        # Upload speed tracking (rolling window)
+        self._upload_speed = 0             # bytes/sec
+        self._upload_samples = []          # list of (timestamp, total_uploaded) tuples
+        self._upload_window = 10           # seconds for rolling average
+
         # Header lines to preserve when clearing output
         self._header_lines = []
+
+        # Track display line count for ANSI cursor repositioning
+        self._display_lines = 0
 
         # Detect IPython/Colab environment
         self._use_clear_output = False
@@ -109,13 +118,14 @@ class PipelineProgress:
         """Store header lines to reprint after each clear_output."""
         self._header_lines = lines
 
-    def update_download(self, progress, speed, eta, seeds, peers):
+    def update_download(self, progress, speed, eta, seeds, peers, downloaded_size=0):
         with self._lock:
             self.download_progress = progress
             self.download_speed = speed
             self.download_eta = eta
             self.seeds = seeds
             self.peers = peers
+            self.downloaded_size = downloaded_size
 
     def update_upload(self, uploaded_size, uploaded_files, queue_size):
         with self._lock:
@@ -123,52 +133,125 @@ class PipelineProgress:
             self.uploaded_files = uploaded_files
             self.upload_queue_size = queue_size
 
+            # Record sample for upload speed calculation
+            now = time.time()
+            self._upload_samples.append((now, uploaded_size))
+
+            # Prune old samples outside the rolling window
+            cutoff = now - self._upload_window
+            self._upload_samples = [(t, s) for t, s in self._upload_samples if t >= cutoff]
+
+            # Calculate upload speed from rolling window
+            if len(self._upload_samples) >= 2:
+                oldest_t, oldest_s = self._upload_samples[0]
+                newest_t, newest_s = self._upload_samples[-1]
+                time_delta = newest_t - oldest_t
+                if time_delta > 0:
+                    self._upload_speed = (newest_s - oldest_s) / time_delta
+                else:
+                    self._upload_speed = 0
+            else:
+                self._upload_speed = 0
+
+    def _format_speed(self, speed_bytes):
+        """Format speed in bytes/sec to human-readable string."""
+        if speed_bytes > 1024 * 1024:
+            return f"{speed_bytes / (1024 * 1024):.1f} MB/s"
+        elif speed_bytes > 0:
+            return f"{speed_bytes / 1024:.1f} KB/s"
+        else:
+            return "0 KB/s"
+
+    def _format_eta(self, remaining_bytes, speed):
+        """Calculate and format ETA from remaining bytes and speed."""
+        if speed <= 0 or remaining_bytes <= 0:
+            return "N/A"
+        eta_seconds = remaining_bytes / speed
+        if eta_seconds < 60:
+            return f"{int(eta_seconds)}s"
+        elif eta_seconds < 3600:
+            return f"{int(eta_seconds / 60)}m {int(eta_seconds % 60)}s"
+        else:
+            hours = int(eta_seconds / 3600)
+            minutes = int((eta_seconds % 3600) / 60)
+            return f"{hours}h {minutes}m"
+
+    def _build_bar(self, fraction, length=30):
+        """Build a progress bar string from a 0.0-1.0 fraction."""
+        fraction = max(0.0, min(1.0, fraction))
+        filled = int(length * fraction)
+        return '█' * filled + '░' * (length - filled)
+
     def display(self):
-        """Print the dual-progress display (Colab-compatible)."""
+        """
+        Print the 3-bar progress display.
+
+        Layout:
+          📊 Overall:  ████████░░░░░░░░░░░░  40.0%  | 1.4/3.6 GB on Drive | Files: 4/12
+          ⬇ Download: ████████████████░░░░  80.0%  | 2.9/3.6 GB | ↓ 12.3 MB/s | ETA: 35s
+          ⬆ Upload:   ████████░░░░░░░░░░░░  40.0%  | 1.4/3.6 GB | ↑ 8.5 MB/s  | ETA: 3m 12s
+        """
         with self._lock:
-            # Download line
-            dl_pct = self.download_progress * 100
-            dl_bar_len = 30
-            dl_filled = int(dl_bar_len * self.download_progress)
-            dl_bar = '█' * dl_filled + '░' * (dl_bar_len - dl_filled)
-
-            if self.download_speed > 1024 * 1024:
-                speed_str = f"{self.download_speed / (1024 * 1024):.1f} MB/s"
-            elif self.download_speed > 0:
-                speed_str = f"{self.download_speed / 1024:.1f} KB/s"
-            else:
-                speed_str = "0 KB/s"
-
-            dl_line = (f"Download: {dl_bar} {dl_pct:5.1f}%  | "
-                       f"Speed: {speed_str} | ETA: {self.download_eta} | "
-                       f"S:{self.seeds} P:{self.peers}")
-
-            # Upload line
+            # ── Overall bar (upload completion = what's on GDrive) ──
             if self.total_size > 0:
-                ul_pct = (self.uploaded_size / self.total_size) * 100
+                overall_frac = self.uploaded_size / self.total_size
             else:
-                ul_pct = 0
-            ul_bar_len = 30
-            ul_filled = int(ul_bar_len * ul_pct / 100)
-            ul_bar = '█' * ul_filled + '░' * (ul_bar_len - ul_filled)
+                overall_frac = 0
+            overall_pct = overall_frac * 100
+            overall_bar = self._build_bar(overall_frac, 30)
 
-            ul_line = (f"Upload:   {ul_bar} {ul_pct:5.1f}%  | "
-                       f"{format_size(self.uploaded_size)}/{format_size(self.total_size)} | "
-                       f"Files: {self.uploaded_files}/{self.total_files} | "
-                       f"Queued: {self.upload_queue_size}")
+            overall_line = (
+                f"📊 Overall:  {overall_bar} {overall_pct:5.1f}%  "
+                f"| {format_size(self.uploaded_size)}/{format_size(self.total_size)} on Drive "
+                f"| Files: {self.uploaded_files}/{self.total_files}"
+            )
+
+            # ── Download bar ──
+            dl_pct = self.download_progress * 100
+            dl_bar = self._build_bar(self.download_progress, 30)
+            dl_speed_str = self._format_speed(self.download_speed)
+            dl_size_str = f"{format_size(self.downloaded_size)}/{format_size(self.total_size)}"
+
+            dl_status = "✅ Done" if self.download_done else f"ETA: {self.download_eta}"
+
+            dl_line = (
+                f"⬇ Download: {dl_bar} {dl_pct:5.1f}%  "
+                f"| {dl_size_str} | ↓ {dl_speed_str} | {dl_status}"
+            )
+
+            # ── Upload bar ──
+            ul_speed_str = self._format_speed(self._upload_speed)
+            ul_remaining = self.total_size - self.uploaded_size
+            ul_eta_str = self._format_eta(ul_remaining, self._upload_speed)
+            ul_pct = overall_pct  # upload % tracks the same as overall
+            ul_bar = overall_bar
+
+            ul_status = "✅ Done" if self.upload_done else f"ETA: {ul_eta_str}"
+
+            ul_line = (
+                f"⬆ Upload:   {ul_bar} {ul_pct:5.1f}%  "
+                f"| {format_size(self.uploaded_size)}/{format_size(self.total_size)} | ↑ {ul_speed_str} | {ul_status}"
+            )
+
+        # Build all output lines
+        output_lines = self._header_lines + [overall_line, dl_line, ul_line]
 
         if self._use_clear_output:
             # Colab/IPython: clear cell output and reprint everything
             self._clear_output_fn(wait=True)
-            for line in self._header_lines:
+            for line in output_lines:
                 print(line)
-            print(dl_line)
-            print(ul_line)
         else:
-            # Terminal fallback: compact single-line with \r
-            compact = (f"\rDL: {dl_pct:5.1f}% {speed_str} ETA:{self.download_eta} | "
-                       f"UL: {ul_pct:5.1f}% {self.uploaded_files}/{self.total_files} files")
-            print(compact, end="", flush=True)
+            # Terminal/IDE: use ANSI escape codes for in-place update
+            if self._display_lines > 0:
+                # Move cursor up to overwrite previous output
+                print(f"\033[{self._display_lines}A", end="")
+
+            for line in output_lines:
+                # Clear line and print
+                print(f"\033[2K{line}")
+
+            self._display_lines = len(output_lines)
 
 
 # ─── Downloader Thread ────────────────────────────────────────────────────────
@@ -283,7 +366,7 @@ def _downloader_thread(source, download_path, session_file, auto_resume,
 
             progress.update_download(
                 s.progress, s.download_rate, eta_str, s.num_seeds,
-                s.num_peers - s.num_seeds
+                s.num_peers - s.num_seeds, downloaded_size=s.total_done
             )
 
             # Check for per-file completion

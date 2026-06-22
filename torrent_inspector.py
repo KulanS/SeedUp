@@ -290,6 +290,23 @@ def display_torrent_info(info, drive_status=None, drive_space=None):
         print(f"\n  Google Drive: {drive_space.get('free_hr', 'N/A')} free / "
               f"{drive_space.get('total_hr', 'N/A')} total  {space_icon} {space_label}")
 
+    # Overall GDrive transfer progress bar (when drive status is available)
+    if drive_status and info.total_size > 0:
+        done_size = 0
+        done_files = 0
+        for f in info.all_files:
+            if f.path in drive_status and "Done" in drive_status[f.path]:
+                done_size += f.size
+                done_files += 1
+        transfer_pct = (done_size / info.total_size) * 100
+        bar_len = 40
+        filled = int(bar_len * transfer_pct / 100)
+        bar = '█' * filled + '░' * (bar_len - filled)
+
+        print(f"\n  📊 GDrive Transfer: {bar} {transfer_pct:5.1f}%")
+        print(f"     {format_size(done_size)} / {format_size(info.total_size)} "
+              f"| Files: {done_files}/{info.file_count} uploaded")
+
     # Column headers
     show_drive = drive_status is not None
     if show_drive:
