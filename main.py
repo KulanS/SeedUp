@@ -167,15 +167,16 @@ Just run your commands directly - no manual setup required!
 def handle_download(args):
     """Handle torrent download command."""
     
+    # Fetch metadata once — used for selection and passed to pipeline
+    from torrent_inspector import inspect_torrent, resolve_selected_indices
+    info = inspect_torrent(args.torrent)
+    if info is None:
+        logger.error("Failed to fetch torrent metadata")
+        return 1
+
     # Resolve file selection
     selected_indices = None
     if args.select and args.select.strip().lower() != 'all':
-        # Need to inspect torrent first to map group indices to file indices
-        from torrent_inspector import inspect_torrent, resolve_selected_indices
-        info = inspect_torrent(args.torrent)
-        if info is None:
-            logger.error("Failed to fetch torrent metadata for selection")
-            return 1
         selected_indices = resolve_selected_indices(info, args.select)
         if selected_indices is not None and len(selected_indices) == 0:
             logger.error("No valid files selected. Use 'all' or valid indices.")
@@ -192,6 +193,7 @@ def handle_download(args):
             selected_indices=selected_indices,
             folder_id=args.folder_id,
             skip_existing=not args.no_skip,
+            torrent_info=info,  # pass pre-fetched metadata
         )
         
         return 0 if result.success else 1
@@ -201,9 +203,14 @@ def handle_download(args):
     print("TORRENT DOWNLOADER")
     print("="*60)
     
+    # Use cached .torrent file if available (avoids re-fetching magnet metadata)
+    dl_source = args.torrent
+    if info.cached_torrent_path and os.path.exists(info.cached_torrent_path):
+        dl_source = info.cached_torrent_path
+
     logger.info(f"Starting download: {args.torrent}")
     downloaded_path = download_torrent(
-        args.torrent,
+        dl_source,
         download_path=args.destination,
         auto_resume=not args.no_resume,
         selected_indices=selected_indices,

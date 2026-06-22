@@ -625,7 +625,7 @@ def _delete_local_file(local_path):
 def run_pipeline(source, download_path=TORRENT_DOWNLOAD_PATH,
                  session_file=TORRENT_SESSION_FILE, auto_resume=True,
                  selected_indices=None, folder_id=None,
-                 skip_existing=True):
+                 skip_existing=True, torrent_info=None):
     """
     Run the incremental download → upload pipeline.
 
@@ -639,29 +639,37 @@ def run_pipeline(source, download_path=TORRENT_DOWNLOAD_PATH,
     :param selected_indices: list of libtorrent file indices to download (None for all)
     :param folder_id: GDrive folder ID (None for auto SeedUp Downloads folder)
     :param skip_existing: skip files already on Drive
+    :param torrent_info: pre-fetched TorrentInfo from inspect_torrent (avoids re-fetching)
     :return: PipelineResult object
     """
     start_time = time.time()
 
-    # We need metadata first to know total size for the space check.
-    # Use torrent_inspector for this (non-destructive metadata fetch).
-    from torrent_inspector import inspect_torrent
     from gdrive_uploader import validate_drive_capacity
 
     print("━" * 60)
     print("📦 SEEDUP PIPELINE — Incremental Download & Upload")
     print("━" * 60)
 
-    # Fetch metadata
-    print("\n📋 Fetching torrent metadata...")
-    torrent_info = inspect_torrent(source)
+    # Use pre-fetched metadata or fetch fresh
     if torrent_info is None:
-        return PipelineResult(
-            torrent_name="Unknown", total_size=0,
-            files_downloaded=0, files_uploaded=0,
-            files_failed=["metadata_fetch_failed"], success=False,
-            elapsed_time=time.time() - start_time,
-        )
+        from torrent_inspector import inspect_torrent
+        print("\n📋 Fetching torrent metadata...")
+        torrent_info = inspect_torrent(source)
+        if torrent_info is None:
+            return PipelineResult(
+                torrent_name="Unknown", total_size=0,
+                files_downloaded=0, files_uploaded=0,
+                files_failed=["metadata_fetch_failed"], success=False,
+                elapsed_time=time.time() - start_time,
+            )
+    else:
+        print("\n📋 Using cached torrent metadata ✓")
+
+    # Use cached .torrent file for the downloader (avoids re-fetching magnet metadata)
+    dl_source = source
+    if torrent_info.cached_torrent_path and os.path.exists(torrent_info.cached_torrent_path):
+        dl_source = torrent_info.cached_torrent_path
+        logger.info(f"Using cached .torrent for download: {dl_source}")
 
     # Calculate effective size based on selection
     if selected_indices is not None:
@@ -719,7 +727,7 @@ def run_pipeline(source, download_path=TORRENT_DOWNLOAD_PATH,
 
     dl_thread = threading.Thread(
         target=_downloader_thread,
-        args=(source, download_path, session_file, auto_resume,
+        args=(dl_source, download_path, session_file, auto_resume,
               selected_indices, file_queue, progress, stop_event, dl_results),
         daemon=True,
     )

@@ -61,6 +61,7 @@ class TorrentInfo:
     groups: List[TorrentGroup]          # first-level groups with indices
     all_files: List[TorrentFileInfo]    # flat list of all files
     is_single_file: bool                # True if torrent has exactly one file
+    cached_torrent_path: Optional[str] = None  # path to cached .torrent file (avoids re-fetching metadata)
 
 
 # ─── Size Formatting ─────────────────────────────────────────────────────────
@@ -166,6 +167,23 @@ def inspect_torrent(source, timeout=METADATA_TIMEOUT):
     # Build first-level groups
     groups = _build_file_tree(all_files, torrent_info.name())
 
+    # Save metadata as a .torrent cache file (avoids re-fetching for magnets)
+    cached_path = None
+    try:
+        ct = lt.create_torrent(torrent_info)
+        entry = ct.generate()
+        torrent_data_out = lt.bencode(entry)
+        cache_dir = TORRENT_DOWNLOAD_PATH
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+        cached_path = os.path.join(cache_dir, f".{torrent_info.info_hash()}.torrent")
+        with open(cached_path, 'wb') as f:
+            f.write(torrent_data_out)
+        logger.info(f"Cached torrent metadata: {cached_path}")
+    except Exception as e:
+        logger.warning(f"Could not cache torrent metadata: {e}")
+        cached_path = None
+
     info = TorrentInfo(
         name=torrent_info.name(),
         info_hash=str(torrent_info.info_hash()),
@@ -174,6 +192,7 @@ def inspect_torrent(source, timeout=METADATA_TIMEOUT):
         groups=groups,
         all_files=all_files,
         is_single_file=(num_files == 1),
+        cached_torrent_path=cached_path,
     )
 
     # Clean up — remove the torrent from session (we only wanted metadata)
