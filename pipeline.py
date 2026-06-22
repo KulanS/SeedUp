@@ -251,13 +251,21 @@ def _downloader_thread(source, download_path, session_file, auto_resume,
         file_completed = set()
         files_downloaded = 0
 
-        while handle.status().state != lt.torrent_status.seeding:
+        while True:
             if stop_event.is_set():
                 save_session(ses, session_file)
                 file_queue.put(None)
                 return
 
             s = handle.status()
+
+            # Exit conditions: all active files completed OR seeding state reached
+            all_files_done = len(file_completed) >= len(active_file_indices)
+            is_seeding = s.state == lt.torrent_status.seeding
+            download_complete = s.total_wanted > 0 and s.total_done >= s.total_wanted
+
+            if all_files_done or is_seeding or download_complete:
+                break
 
             # Calculate ETA
             eta_str = "N/A"

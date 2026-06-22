@@ -154,8 +154,15 @@ def download_torrent(source, download_path=TORRENT_DOWNLOAD_PATH,
         logger.info(f"Selective download: {selected_count}/{num_files} files selected")
 
     try:
-        while handle.status().state != lt.torrent_status.seeding:
+        while True:
             s = handle.status()
+
+            # Exit when download is complete or seeding
+            if s.state == lt.torrent_status.seeding:
+                break
+            if s.total_wanted > 0 and s.total_done >= s.total_wanted:
+                break
+
             progress = s.progress * 100
 
             # Calculate ETA
